@@ -45,6 +45,18 @@ class Store:
         CREATE INDEX IF NOT EXISTS queue_due ON queue(state,due);
         ''')
         self.c.execute("UPDATE queue SET state='pending' WHERE state='sending'")
+        columns={r[1] for r in self.c.execute('PRAGMA table_info(orders)')}
+        if 'number' not in columns:
+            self.c.execute('ALTER TABLE orders ADD COLUMN number TEXT')
+        self.c.executescript('''
+        CREATE UNIQUE INDEX IF NOT EXISTS order_number ON orders(number) WHERE number IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS screens(uid INTEGER PRIMARY KEY, mid INTEGER);
+        CREATE TABLE IF NOT EXISTS actions(chat INTEGER, mid INTEGER, action TEXT,
+          PRIMARY KEY(chat,mid,action));
+        CREATE TABLE IF NOT EXISTS review_sessions(uid INTEGER PRIMARY KEY, oid INTEGER);
+        CREATE TABLE IF NOT EXISTS reviews(oid INTEGER PRIMARY KEY, body TEXT, rating INTEGER,
+          state TEXT DEFAULT 'draft', due REAL DEFAULT 0, tries INTEGER DEFAULT 0);
+        ''')
         self.migrate()
         self.c.commit()
 
@@ -125,6 +137,21 @@ class Store:
     def event(self, oid, action):
         self.execute('INSERT INTO events(oid,action,created) VALUES(?,?,?)',
                      (oid,action,time.time()))
+
+    def number(self, oid, value):
+        if not value.isascii() or not value.isdigit() or not 1<=int(value)<=999999999:
+            raise ValueError('Пример: /number 125. Нужен положительный номер до 9 цифр.')
+        value=str(int(value))
+        try:
+            self.execute('UPDATE orders SET number=? WHERE id=?',(value,oid))
+        except sqlite3.IntegrityError:
+            raise ValueError('Этот номер уже занят другим заказом.') from None
+        self.event(oid,'Назначен номер '+value)
+        self.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'rename:{oid}','1'))
+
+    def claim(self, chat, mid, action):
+        return bool(self.execute('INSERT OR IGNORE INTO actions VALUES(?,?,?)',
+                                (chat,mid,action)).rowcount)
 
     def attach_pending(self, uid, oid):
         with self.c:

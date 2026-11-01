@@ -7,6 +7,7 @@ from html import escape
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import time
 from zoneinfo import ZoneInfo
@@ -19,7 +20,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, BotCommand, ErrorEvent
-from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio, LinkPreviewOptions
 from db import Store, TERMINAL
 from facts import FACTS
 
@@ -77,8 +78,11 @@ def payload(m):
 
 
 class App:
-    def __init__(self, store, bot, forum, admins, owner=None):
+    def __init__(self, store, bot, forum, admins, owner=None, reviews_chat=None):
         self.s,self.bot,self.forum,self.admins,self.owner = store,bot,forum,set(admins),owner
+        self.reviews_chat=reviews_chat
+        if reviews_chat and reviews_chat==forum:
+            raise ValueError('Группа отзывов должна отличаться от рабочей группы.')
         self.locks = defaultdict(asyncio.Lock)
         self.router = Router()
         r = self.router
@@ -97,6 +101,47 @@ class App:
         return keyboard([[('📝 Новая заявка','new'),('📂 Мои заказы','mine:0')],
                          [('💬 Задать вопрос','talk'),('ℹ️ Частые вопросы','faq')]])
 
+    def label(self,o):
+        return 'Заказ №'+o['number'] if o.get('number') else 'Заявка от '+datetime.fromtimestamp(o['created'],ZoneInfo('Europe/Moscow')).strftime('%d.%m %H:%M')
+
+    async def remove(self,chat,mid):
+        if not mid: return
+        try:
+            await self.bot.delete_message(chat,mid)
+        except TelegramBadRequest:
+            # Old Telegram messages may be too old to delete. Disable their buttons.
+            try: await self.bot.edit_message_reply_markup(chat_id=chat,message_id=mid,reply_markup=None)
+            except TelegramBadRequest: pass
+
+    async def clear_screen(self,uid):
+        screen=self.s.one('SELECT mid FROM screens WHERE uid=?',(uid,))
+        if screen:
+            await self.remove(uid,screen['mid'])
+        # Pause form UI without losing its answers or current step.
+        for o in self.s.orders(uid):
+            if o['form_msg']:
+                await self.remove(uid,o['form_msg'])
+                self.s.set_order(o['id'],form_msg=None)
+        self.s.execute('DELETE FROM screens WHERE uid=?',(uid,))
+        self.s.execute('UPDATE users SET selector=NULL WHERE id=?',(uid,))
+
+    async def screen(self,uid,text,markup=None):
+        await self.clear_screen(uid)
+        m=await self.bot.send_message(uid,text,reply_markup=markup)
+        self.s.execute('INSERT OR REPLACE INTO screens VALUES(?,?)',(uid,m.message_id))
+        return m
+
+    async def consume(self,c,action):
+        mid=getattr(c.message,'message_id',None)
+        if isinstance(mid,int) and not self.s.claim(c.message.chat.id,mid,action):
+            raise ValueError('Это действие уже выполнено. Откройте главное меню.')
+
+    def current(self,uid,oid):
+        o=self.own(uid,oid)
+        if self.s.user(uid)['selected']!=oid:
+            raise ValueError('Кнопка относится к другому заказу. Выберите его в «Мои заказы».')
+        return o
+
     def own(self, uid, oid):
         o=self.s.order(oid)
         if not o or o['user_id']!=uid:
@@ -109,12 +154,13 @@ class App:
             await self.show_menu(m.from_user.id)
 
     async def show_menu(self,uid):
+        self.s.execute('DELETE FROM review_sessions WHERE uid=?',(uid,))
         u=self.s.user(uid)
         if not u['greeted']:
             await self.bot.send_message(uid,WELCOME,reply_markup=ReplyKeyboardMarkup(
                 keyboard=[[KeyboardButton(text='🏠 Главное меню')]],resize_keyboard=True))
             self.s.execute('UPDATE users SET greeted=1 WHERE id=?',(uid,))
-        await self.bot.send_message(uid,'Выберите действие 👇',reply_markup=self.menu_keys())
+        await self.screen(uid,'Выберите действие 👇',self.menu_keys())
 
     async def create(self,uid,form=False):
         o=self.s.new_order(uid)
@@ -128,28 +174,28 @@ class App:
         if u['selector']:
             return
         orders=self.s.orders(uid)
-        rows=[[(f"№{o['id']} · {(o['title'] or o['work'] or 'Заявка')[:30]}",f"select:{o['id']}")] for o in orders[:8]]
+        rows=[[(f"{self.label(o)} · {(o['title'] or o['work'] or 'Заявка')[:30]}",f"select:{o['id']}")] for o in orders[:8]]
         rows.append([('🆕 Новый заказ','new')])
-        msg=await self.bot.send_message(uid,'Выберите заказ для сообщения или создайте новый. Отправленные материалы сохранены до выбора.',reply_markup=keyboard(rows))
+        msg=await self.screen(uid,'Выберите заказ для сообщения или создайте новый. Отправленные материалы сохранены до выбора.',keyboard(rows))
         self.s.execute('UPDATE users SET selector=? WHERE id=?',(msg.message_id,uid))
 
     async def ensure_topic(self,oid):
         o=self.s.order(oid)
         if not o['thread']:
             u=self.s.user(o['user_id'])
-            t=await self.bot.create_forum_topic(self.forum,name=f"№{oid} · {u['name']}"[:128])
+            t=await self.bot.create_forum_topic(self.forum,name=f"{self.label(o)} · {u['name']}"[:128])
             self.s.set_order(oid,thread=t.message_thread_id)
         await self.card(oid)
         if not self.s.one('SELECT value FROM meta WHERE key=?',(f'announced:{oid}',)):
             o=self.s.order(oid)
-            await self.bot.send_message(self.forum,f'🆕 Новая заявка №{oid}',message_thread_id=o['thread'])
+            await self.bot.send_message(self.forum,f'🆕 {self.label(o)}',message_thread_id=o['thread'])
             self.s.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',(f'announced:{oid}','1'))
             self.s.event(oid,'notified')
 
     def card_text(self,o,client=False):
         u=self.s.user(o['user_id'])
         deadline=datetime.fromisoformat(o['deadline']).strftime('%d.%m.%Y %H:%M') if o['deadline'] else 'Не уточнён'
-        text=f"<b>№{o['id']} · {STATUSES[o['status']]}</b>\n"
+        text=f"<b>{self.label(o)} · {STATUSES[o['status']]}</b>\n"
         if not client:
             text+=f"👤 {escape(u['name'][:70])} · {escape('@'+u['username'] if u['username'] else 'без username')}\n🆔 <code>{u['id']}</code>\n"
         for icon,key in [('📘','work'),('📚','subject'),('📝','title'),('🔍','anti')]:
@@ -206,14 +252,14 @@ class App:
         values=WORK if step==0 else SUBJECT if step==1 else ['Не знаю / уточню позже'] if step==3 else []
         rows=[[(v,f'answer:{oid}:{step}:{i}')] for i,v in enumerate(values)]
         rows.append([('⬅️ Назад',f'back:{oid}:{step}'),('Пропустить',f'skip:{oid}:{step}')])
-        text=f"<b>Заявка №{oid} · Шаг {step+1} из 5</b>\n{QUESTIONS[step]}"
+        text=f"<b>{self.label(o)} · Шаг {step+1} из 5</b>\n{QUESTIONS[step]}"
         if o['form_msg']:
             try:
                 await self.bot.edit_message_text(text,chat_id=o['user_id'],message_id=o['form_msg'],reply_markup=keyboard(rows))
                 return
             except TelegramBadRequest as e:
                 if 'not modified' in str(e): return
-        msg=await self.bot.send_message(o['user_id'],text,reply_markup=keyboard(rows))
+        msg=await self.screen(o['user_id'],text,keyboard(rows))
         self.s.set_order(oid,form_msg=msg.message_id)
 
     async def advance(self,o,value):
@@ -224,18 +270,18 @@ class App:
             value=date_value(value)
         self.s.set_order(o['id'],**{field:value},step=o['step']+1 if o['step']<4 else -1)
         if o['step']==4:
-            await self.bot.edit_message_text('Данные сохранены. Можно добавить материалы.',
-                chat_id=o['user_id'],message_id=o['form_msg'])
+            await self.clear_screen(o['user_id'])
             await self.receipt(o['id'])
         else:
             await self.form(o['id'])
+        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'rename:{o["id"]}','1'))
 
     async def receipt(self,oid):
         o=self.s.order(oid)
         if o['receipt']:
             return
         msg=await self.bot.send_message(o['user_id'],
-          f'Заявка №{oid}. Можете отправить остальные материалы сюда. Когда закончите, нажмите «Всё отправлено».',
+          f'{self.label(o)}. Можете отправить остальные материалы сюда. Когда закончите, нажмите «Всё отправлено».',
           reply_markup=keyboard([[('Всё отправлено',f'finish:{oid}')]]))
         self.s.set_order(oid,receipt=msg.message_id)
 
@@ -247,6 +293,21 @@ class App:
             if m.text in ('🏠 Главное меню','🚀 Старт'):
                 await self.show_menu(uid); return
             if u['blocked']:
+                return
+            review=self.s.one('SELECT oid FROM review_sessions WHERE uid=?',(uid,))
+            if review:
+                if not m.text or len(m.text)>3000:
+                    await self.bot.send_message(uid,'Для анонимного отзыва нужен только текст до 3000 символов. Вложения не публикуются.'); return
+                if re.search(r'@|https?://|t\.me/|№\s*\d|заказ\w*\s+\d|\+?\d[\d ()-]{8,}\d',m.text,re.I):
+                    await self.bot.send_message(uid,'Уберите контакты, ссылки и длинные номера из отзыва.'); return
+                o=self.own(uid,review['oid'])
+                existing=self.s.one('SELECT state FROM reviews WHERE oid=?',(o['id'],))
+                if existing and existing['state']!='draft':
+                    await self.bot.send_message(uid,'Отзыв уже передан для публикации.'); return
+                self.s.execute('INSERT OR REPLACE INTO reviews(oid,body,rating,state) VALUES(?,?,?,?)',
+                    (o['id'],m.text,o['rating'],'draft'))
+                await self.screen(uid,'<b>Предпросмотр анонимного отзыва</b>\n'+escape(m.text)+'\n\nПроверьте, что текст не раскрывает вашу личность.',
+                    keyboard([[('Опубликовать',f'publish:{o["id"]}'),('Отмена','reviewcancel')]]))
                 return
             if m.text and m.text.startswith('/'):
                 await m.answer('Для навигации используйте /start или «🏠 Главное меню».'); return
@@ -265,10 +326,7 @@ class App:
             if not accepted: return
             if not o:
                 await self.choose(uid); return
-            if o['review']:
-                self.s.set_order(o['id'],review=0)
-                self.s.event(o['id'],'Клиент оставил обратную связь')
-            if o['step']>=0 and m.text:
+            if o['step']>=0 and o['form_msg'] and m.text:
                 try:
                     await self.advance(o,m.text[:500])
                 except ValueError as e:
@@ -298,6 +356,18 @@ class App:
             return
         o=self.s.one('SELECT * FROM orders WHERE thread=?',(m.message_thread_id,))
         if not o: return
+        if cmd=='/number':
+            try:
+                self.s.number(o['id'],text.partition(' ')[2].strip())
+                await self.rename(o['id'])
+                await self.card(o['id'])
+                await m.answer('Номер сохранён, название темы и карточка обновлены.',disable_notification=True)
+            except ValueError as e:
+                await m.answer(str(e),disable_notification=True)
+            return
+        if cmd=='/retryreviews':
+            self.s.execute("UPDATE reviews SET state='pending',due=0,tries=0 WHERE state='failed'")
+            await m.answer('Повтор публикации отзывов запланирован.',disable_notification=True); return
         if cmd=='/note':
             self.s.event(o['id'],'Заметка: '+text.partition(' ')[2]); return
         if cmd in ('/block','/unblock'):
@@ -314,7 +384,7 @@ class App:
             await m.answer('Пример: /search Анна или /search 1042',disable_notification=True); return
         term='%'+query.replace('%','').replace('_','')+'%'
         rows=self.s.all('''SELECT o.* FROM orders o JOIN users u ON o.user_id=u.id
-          WHERE CAST(o.id AS TEXT)=? OR CAST(u.id AS TEXT)=? OR u.name LIKE ?
+          WHERE o.number=? OR CAST(u.id AS TEXT)=? OR u.name LIKE ?
           OR u.username LIKE ? ORDER BY o.id DESC LIMIT 20''',(query,query,term,term))
         await self.send_order_list(m.chat.id,rows,'Результаты поиска')
 
@@ -325,7 +395,7 @@ class App:
                 url=f"https://t.me/c/{str(self.forum).removeprefix('-100')}/{o['thread']}"
                 u=self.s.user(o['user_id'])
                 wait=f" · ждёт {int((time.time()-o['waiting'])/60)} мин" if o['waiting'] else ''
-                rows.append([InlineKeyboardButton(text=f"№{o['id']} · {u['name'][:22]}{wait}",url=url)])
+                rows.append([InlineKeyboardButton(text=f"{self.label(o)} · {u['name'][:22]}{wait}",url=url)])
         if extra: rows.extend(extra)
         text=title if orders else title+'\nЗаказов нет.'
         markup=InlineKeyboardMarkup(inline_keyboard=rows)
@@ -375,35 +445,57 @@ class App:
         if self.s.user(uid)['blocked']:
             raise ValueError('Доступ ограничен. Свяжитесь с OneStudy другим способом.')
         await c.answer()
+        mid=getattr(c.message,'message_id',None)
+        screen=self.s.one('SELECT mid FROM screens WHERE uid=?',(uid,))
+        if isinstance(mid,int) and screen and data.split(':')[0] in ('new','confirmnew','talk','mine','view','select','faq','publish','reviewcancel') and screen['mid']!=mid:
+            raise ValueError('Это старое меню. Используйте последнее или нажмите «🏠 Главное меню».')
         if data=='new':
-            # Old menu presses do not create duplicates while an empty form is open.
+            await self.consume(c,'new')
             old=self.s.order(self.s.user(uid)['selected'])
-            o=old if old and old['step']>=0 else await self.create(uid,True)
+            if old and old['status'] not in TERMINAL:
+                if old['step']>=0 or (old['status']=='new' and not old['work'] and not old['title'] and not old['number']):
+                    if old['step']<0: self.s.set_order(old['id'],step=0)
+                    await self.clear_screen(uid)
+                    await self.form(old['id']); return
+                await self.screen(uid,'У вас уже есть активная заявка. Продолжить её или создать отдельную?',
+                    keyboard([[('Продолжить',f'select:{old["id"]}'),('Создать отдельную','confirmnew')]])); return
+            o=await self.create(uid,True)
+            await self.clear_screen(uid)
             await self.form(o['id'])
+        elif data=='confirmnew':
+            await self.consume(c,'confirmnew')
+            o=await self.create(uid,True)
+            await self.clear_screen(uid); await self.form(o['id'])
         elif data=='talk':
             orders=self.s.orders(uid)
-            if not orders: await self.create(uid)
-            elif len(orders)>1 or orders[0]['status'] in TERMINAL: await self.choose(uid)
-            await self.bot.send_message(uid,'Напишите вопрос или отправьте материалы сюда.')
+            if len(orders)>1 or (orders and orders[0]['status'] in TERMINAL):
+                await self.choose(uid)
+            else:
+                await self.screen(uid,'Напишите вопрос или отправьте материалы сюда.')
         elif data.startswith('mine:'):
             page=max(0,int(data.split(':')[1]))
             orders=self.s.orders(uid)[page*8:page*8+9]
-            rows=[[(f"№{o['id']} · {STATUSES[o['status']]}",f'view:{o["id"]}')] for o in orders[:8]]
+            rows=[[(f"{self.label(o)} · {STATUSES[o['status']]}",f'view:{o["id"]}')] for o in orders[:8]]
             if page: rows.append([('⬅️ Назад',f'mine:{page-1}')])
             if len(orders)>8: rows.append([('Далее ➡️',f'mine:{page+1}')])
-            await self.bot.send_message(uid,'📂 Мои заказы' if orders else 'Пока заказов нет.',reply_markup=keyboard(rows))
+            await self.screen(uid,'📂 Мои заказы' if orders else 'Пока заказов нет.',keyboard(rows))
         elif data.startswith('view:'):
             o=self.own(uid,int(data.split(':')[1]))
-            await self.bot.send_message(uid,self.card_text(o,True),reply_markup=keyboard([[('💬 Написать / добавить материалы',f'select:{o["id"]}')]]))
+            await self.screen(uid,self.card_text(o,True),keyboard([[('💬 Написать / добавить материалы',f'select:{o["id"]}')]]))
         elif data.startswith('select:'):
             oid=int(data.split(':')[1]); self.own(uid,oid)
+            await self.consume(c,'select')
+            await self.clear_screen(uid)
             self.s.select(uid,oid)
-            await c.message.edit_text(f'Выбран заказ №{oid}. Сообщения будут направляться в него.')
+            await self.remove(uid,getattr(c.message,'message_id',None))
+            await self.screen(uid,f'Выбрана: {self.label(self.s.order(oid))}. Напишите сообщение или отправьте материалы.')
             await self.receipt(oid)
         elif data.startswith(('answer:','skip:','back:')):
-            parts=data.split(':'); oid,step=int(parts[1]),int(parts[2]); o=self.own(uid,oid)
+            parts=data.split(':'); oid,step=int(parts[1]),int(parts[2]); o=self.current(uid,oid)
             if o['step']!=step or o['status'] in TERMINAL:
                 raise ValueError('Этот шаг уже изменился. Откройте актуальную анкету.')
+            if isinstance(mid,int) and o['form_msg']!=mid:
+                raise ValueError('Эта анкета больше не активна. Откройте её из главного меню.')
             if parts[0]=='back':
                 self.s.set_order(oid,step=max(0,step-1)); await self.form(oid)
             else:
@@ -411,7 +503,7 @@ class App:
                 value=options[int(parts[3])] if parts[0]=='answer' else ''
                 await self.advance(o,value)
         elif data.startswith('finish:'):
-            oid=int(data.split(':')[1]); o=self.own(uid,oid)
+            oid=int(data.split(':')[1]); o=self.current(uid,oid)
             if o['status'] in TERMINAL: raise ValueError('Заказ уже завершён')
             if not o['fact']:
                 self.s.set_order(oid,fact=self.s.fact(uid,FACTS))
@@ -428,15 +520,34 @@ class App:
             await c.message.edit_text(f'Спасибо за оценку! {rating}/5.',reply_markup=keyboard([[('Оставить отзыв / рассказать о проблеме',f'review:{oid}')]]))
             await self.card(o['id'])
         elif data.startswith('review:'):
-            oid=int(data.split(':')[1]); self.own(uid,oid); self.s.select(uid,oid)
-            self.s.set_order(oid,review=1)
-            await self.bot.send_message(uid,'Напишите отзыв или расскажите о проблеме. Сообщение получит менеджер.')
+            oid=int(data.split(':')[1]); o=self.own(uid,oid)
+            if not self.reviews_chat: raise ValueError('Группа отзывов пока не настроена.')
+            existing=self.s.one('SELECT state FROM reviews WHERE oid=?',(oid,))
+            if existing and existing['state']!='draft': raise ValueError('Отзыв уже сохранён для публикации.')
+            if o['rating'] is None: raise ValueError('Сначала поставьте оценку.')
+            await self.consume(c,'review')
+            self.s.execute('INSERT OR REPLACE INTO review_sessions VALUES(?,?)',(uid,oid))
+            await self.remove(uid,getattr(c.message,'message_id',None))
+            await self.screen(uid,'Отзыв будет опубликован анонимно. Не указывайте имя, контакты, номер заказа и сведения, по которым вас можно узнать.\nОтправьте только текст.',keyboard([[('Отмена','reviewcancel')]]))
+        elif data=='reviewcancel':
+            session=self.s.one('SELECT oid FROM review_sessions WHERE uid=?',(uid,))
+            if session: self.s.execute("DELETE FROM reviews WHERE oid=? AND state='draft'",(session['oid'],))
+            self.s.execute('DELETE FROM review_sessions WHERE uid=?',(uid,))
+            await self.screen(uid,'Публикация отменена.')
+        elif data.startswith('publish:'):
+            oid=int(data.split(':')[1]); self.own(uid,oid)
+            session=self.s.one('SELECT oid FROM review_sessions WHERE uid=?',(uid,))
+            if not session or session['oid']!=oid: raise ValueError('Начните отзыв заново.')
+            await self.consume(c,'publish')
+            self.s.execute("UPDATE reviews SET state='pending' WHERE oid=? AND state='draft'",(oid,))
+            self.s.execute('DELETE FROM review_sessions WHERE uid=?',(uid,))
+            await self.screen(uid,'Спасибо! Отзыв сохранён и поставлен в очередь анонимной публикации.')
         elif data=='faq':
-            await c.message.edit_text('Частые вопросы',reply_markup=keyboard([[(v[0],'faq:'+k)] for k,v in FAQ.items()]))
+            await self.screen(uid,'Частые вопросы',keyboard([[(v[0],'faq:'+k)] for k,v in FAQ.items()]))
         elif data.startswith('faq:'):
             key=data.split(':')[1]
             if key not in FAQ: raise ValueError('Вопрос не найден')
-            await c.message.edit_text(FAQ[key][1],reply_markup=keyboard([[('⬅️ К вопросам','faq')]]))
+            await self.screen(uid,FAQ[key][1],keyboard([[('⬅️ К вопросам','faq')]]))
 
     async def admin_callback(self,c,data):
         if data.startswith('dash:'):
@@ -453,15 +564,16 @@ class App:
             self.s.set_order(oid,status=status,activity=time.time(),warned=0)
             self.s.event(oid,'Статус: '+status)
             await self.card(oid)
+            await self.remove(self.forum,getattr(c.message,'message_id',None))
         elif parts[0]=='card':
             await self.card(oid)
             history=self.s.all('SELECT action,created FROM events WHERE oid=? AND action!=? ORDER BY id DESC LIMIT 8',(oid,'notified'))
             details=self.card_text(self.s.order(oid))+'\n\n<b>История</b>\n'+'\n'.join(escape(r['action'][:200]) for r in history)
             await c.message.reply(details,disable_notification=True)
         elif parts[0]=='close':
-            await c.message.reply(f'Завершить заказ №{oid}?',reply_markup=keyboard([[('Завершить',f'confirm:{oid}'),('Отмена',f'cancelclose:{oid}')]]),disable_notification=True)
+            await c.message.reply(f'Завершить {self.label(o)}?',reply_markup=keyboard([[('Завершить',f'confirm:{oid}'),('Отмена',f'cancelclose:{oid}')]]),disable_notification=True)
         elif parts[0]=='cancelclose':
-            await c.message.edit_text('Завершение отменено.')
+            await self.remove(self.forum,getattr(c.message,'message_id',None))
         elif parts[0]=='confirm':
             if o['status']=='done': return
             if self.s.one("SELECT id FROM queue WHERE oid=? AND state!='sent' LIMIT 1",(oid,)):
@@ -472,8 +584,34 @@ class App:
                 self.s.c.execute('INSERT INTO events(oid,action,created) VALUES(?,?,?)',(oid,'Завершён менеджером',time.time()))
                 self.s.c.execute('INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)',
                     (f'close:{oid}',json.dumps({'uid':o['user_id'],'due':0,'tries':0})))
-            await c.message.edit_text(f'Заказ №{oid} завершён. Уведомление клиенту поставлено в очередь.')
+            await self.remove(self.forum,getattr(c.message,'message_id',None))
             await self.card(oid)
+
+    async def rename(self,oid):
+        o=self.s.order(oid)
+        if not o['thread']: return
+        u=self.s.user(o['user_id'])
+        name=f"{self.label(o)} · {u['name'][:40]} · {o['work'][:30]}"[:128]
+        try: await self.bot.edit_forum_topic(self.forum,o['thread'],name=name)
+        except TelegramBadRequest as e:
+            if 'not modified' not in str(e): raise
+        self.s.execute('DELETE FROM meta WHERE key=?',(f'rename:{oid}',))
+
+    async def publish_reviews(self):
+        if not self.reviews_chat: return
+        for r in self.s.all("SELECT * FROM reviews WHERE state='pending' AND due<=? LIMIT 3",(time.time(),)):
+            grade=f"Оценка: {r['rating']}/5\n" if r['rating'] else ''
+            try:
+                # Never forward/copy, never include identifiers, metadata or links.
+                await self.bot.send_message(self.reviews_chat,'💬 <b>Новый отзыв</b>\n'+grade+'\n'+escape(r['body']),
+                    link_preview_options=LinkPreviewOptions(is_disabled=True))
+                self.s.execute("UPDATE reviews SET state='sent' WHERE oid=?",(r['oid'],))
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter) as e:
+                tries=r['tries']+1
+                delay=e.retry_after+1 if isinstance(e,TelegramRetryAfter) else min(300,2**tries)
+                self.s.execute('UPDATE reviews SET state=?,tries=?,due=? WHERE oid=?',
+                    ('failed' if tries>=8 else 'pending',tries,time.time()+delay,r['oid']))
+                if tries==1: await self.alert('⚠️ Не удалось опубликовать анонимный отзыв. Проверьте REVIEWS_CHAT_ID и права бота.')
 
     async def fallback_send(self,row,target,thread,silent):
         d=json.loads(row['payload']); kind=d.get('kind'); opts=dict(chat_id=target,disable_notification=silent)
@@ -532,6 +670,11 @@ class App:
         await self.card(o['id'])
 
     async def tick(self):
+        await self.publish_reviews()
+        for item in self.s.all("SELECT key FROM meta WHERE key LIKE 'rename:%' LIMIT 3"):
+            try: await self.rename(int(item['key'].split(':')[1]))
+            except (TelegramBadRequest,TelegramNetworkError,TelegramRetryAfter):
+                log.warning('Topic rename deferred')
         for o in self.s.all('SELECT * FROM orders WHERE thread IS NULL LIMIT 5'):
             try: await self.ensure_topic(o['id'])
             except Exception:
@@ -551,20 +694,21 @@ class App:
                         ('failed' if failed else 'pending',tries,time.time()+delay,type(e).__name__,row['id']))
                 if not rows[0]['alerted']:
                     self.s.execute('UPDATE queue SET alerted=1 WHERE id=?',(rows[0]['id'],))
-                    await self.alert(f"⚠️ Задержка передачи по заказу №{rows[0]['oid']}. Проверьте очередь командой /retry в теме. Ошибка: {type(e).__name__}",rows[0]['oid'])
+                    await self.alert(f"⚠️ Задержка передачи по {self.label(self.s.order(rows[0]['oid']))}. Проверьте очередь командой /retry в теме. Ошибка: {type(e).__name__}",rows[0]['oid'])
                     if rows[0]['direction']=='in':
                         try: await self.bot.send_message(self.s.order(rows[0]['oid'])['user_id'],'Передача материалов задерживается. Они сохранены, менеджер уведомлён.',disable_notification=True)
                         except Exception: pass
         for o in self.s.all('SELECT * FROM orders WHERE finish=1'):
+            if self.s.user(o['user_id'])['selected']!=o['id']: continue
             if self.s.pending(o['id']): continue
             try:
-                await self.bot.edit_message_text(f"Материалы по заказу №{o['id']} переданы менеджеру ✅\nОтвет придёт сюда. Дополнения можно отправлять в этот чат.\n\n💡 Учебная минутка\n{escape(o['fact'] or '')}",
+                await self.bot.edit_message_text(f"{self.label(o)}: материалы переданы менеджеру ✅\nОтвет придёт сюда. Дополнения можно отправлять в этот чат.\n\n💡 Учебная минутка\n{escape(o['fact'] or '')}",
                     chat_id=o['user_id'],message_id=o['receipt'])
             except TelegramBadRequest as e:
                 if 'not modified' not in str(e):
-                    await self.alert(f"Не удалось обновить подтверждение заказа №{o['id']}",o['id'])
+                    await self.alert(f"Не удалось обновить подтверждение заказа {self.label(o)}",o['id'])
             except TelegramForbiddenError:
-                await self.alert(f"Клиент заказа №{o['id']} недоступен для подтверждения.",o['id'])
+                await self.alert(f"Клиент заказа {self.label(o)} недоступен для подтверждения.",o['id'])
             self.s.set_order(o['id'],finish=0,batch=0)
         for item in self.s.all("SELECT * FROM meta WHERE key LIKE 'close:%' LIMIT 5"):
             oid=int(item['key'].split(':')[1]); o=self.s.order(oid)
@@ -573,13 +717,13 @@ class App:
             if o['status']!='done':
                 self.s.execute('DELETE FROM meta WHERE key=?',(item['key'],)); continue
             try:
-                await self.bot.send_message(notice['uid'],f'Заказ №{oid} завершён. Спасибо за обращение!\nОцените, пожалуйста, как прошла работа.',
+                await self.bot.send_message(notice['uid'],f'{self.label(o)} завершён. Спасибо за обращение!\nОцените, пожалуйста, как прошла работа.',
                     reply_markup=keyboard([[(f'{n}/5',f'rate:{oid}:{n}') for n in range(1,6)]]))
             except TelegramForbiddenError:
-                await self.alert(f'Клиент заказа №{oid} заблокировал бота. Уведомление о завершении не доставлено.',oid)
+                await self.alert(f'Клиент {self.label(o)} заблокировал бота. Уведомление о завершении не доставлено.',oid)
                 self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'failed_close:{oid}',item['value']))
             except TelegramBadRequest:
-                await self.alert(f'Не удалось отправить завершение заказа №{oid}. После устранения причины используйте /retry.',oid)
+                await self.alert(f'Не удалось отправить завершение {self.label(o)}. После устранения причины используйте /retry.',oid)
                 self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'failed_close:{oid}',item['value']))
             except (TelegramRetryAfter,TelegramNetworkError) as e:
                 notice['tries']+=1
@@ -592,7 +736,7 @@ class App:
         now=time.time()
         for o in self.s.all("SELECT * FROM orders WHERE status NOT IN ('done','cancelled','archive')"):
             if o['thread'] and o['waiting'] and now-o['waiting']>=1800 and not o['reminded']:
-                await self.bot.send_message(self.forum,f"⏰ Клиент по заказу №{o['id']} ждёт ответа.",message_thread_id=o['thread'])
+                await self.bot.send_message(self.forum,f"⏰ Клиент по заказу {self.label(o)} ждёт ответа.",message_thread_id=o['thread'])
                 self.s.set_order(o['id'],reminded=1)
             days=(now-o['activity'])/86400
             if days>=30 and o['status'] in ('new','clarify') and not self.s.pending(o['id']):
@@ -602,13 +746,15 @@ class App:
                 self.s.set_order(o['id'],warned=1)
 
     async def guide(self):
-        if self.s.one("SELECT value FROM meta WHERE key='guide_v3'"): return
-        t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3')
+        if self.s.one("SELECT value FROM meta WHERE key='guide_v31'"): return
+        t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3.1')
         msg=await self.bot.send_message(self.forum,
-          '<b>OneStudy v3 · менеджеру</b>\n\n'
+          '<b>OneStudy v3.1 · менеджеру</b>\n\n'
           '/orders или /clients — список заказов.\n'
           '/search Анна — поиск по имени; также можно указать номер или Telegram ID.\n'
           '/done — завершение с подтверждением в теме заказа.\n'
+          '/number 125 — ваш номер заказа: меняет тему, карточку и сводки.\n'
+          '/retryreviews — повторить неудачные публикации анонимных отзывов (из темы заказа).\n'
           '/note текст — внутренняя заметка, клиент её не получит.\n'
           '/retry — повторить неудачные отправки в этой теме.\n'
           '/block и /unblock — ограничить или восстановить приём сообщений клиента.\n\n'
@@ -621,7 +767,7 @@ class App:
           message_thread_id=t.message_thread_id,disable_notification=True,
           reply_markup=keyboard([[('📋 Заказы','dash:all:0')]]))
         await self.bot.pin_chat_message(self.forum,msg.message_id,disable_notification=True)
-        self.s.execute("INSERT INTO meta VALUES('guide_v3',?)",(str(t.message_thread_id),))
+        self.s.execute("INSERT INTO meta VALUES('guide_v31',?)",(str(t.message_thread_id),))
 
     async def worker(self):
         last_maintenance=0; last_backup=0
@@ -666,7 +812,8 @@ async def main():
             raise RuntimeError('У бота настроен webhook. Удалите его перед запуском long polling, сохранив ожидающие обновления.')
         await bot.set_my_commands([BotCommand(command='start',description='Главное меню')])
         owner=int(os.environ.get('OWNER_CHAT_ID','0')) or None
-        app=App(store,bot,forum,admins,owner)
+        reviews_chat=int(os.environ.get('REVIEWS_CHAT_ID','0')) or None
+        app=App(store,bot,forum,admins,owner,reviews_chat)
         try: await app.guide()
         except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError):
             log.warning('Не удалось создать служебную инструкцию; см. README.md')
