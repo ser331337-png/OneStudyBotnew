@@ -1,12 +1,14 @@
-"""OneStudy v3.3: one process, persistent inbox/outbox and multiple orders."""
+"""OneStudy v3.4: one process, persistent inbox/outbox and multiple orders."""
 from __future__ import annotations
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 import calendar
 from html import escape
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -52,6 +54,78 @@ FAQ = {'pay':('💳 Оплата','50% предоплата. По мере го�
  'anti':('🔍 Антиплагиат','Сообщите систему проверки и требуемый процент оригинальности. Условия получения отчёта уточните у менеджера.'),
  'files':('📎 Материалы','Пришлите тему, требования, методичку и дату сдачи. Сообщения передаются менеджеру даже без заполнения анкеты.')}
 log = logging.getLogger('onestudy')
+BACKGROUND_REQUEST = ContextVar('onestudy_background_request',default=False)
+
+
+class RateGuard:
+    """Retry only explicit 429 rejections; never replay ambiguous network failures.
+
+    One chat budget covers all forum topics. Long background cooldowns are
+    deferred to durable jobs so the worker can continue with other chats.
+    """
+    def __init__(self,store,clock=time.time,sleep=asyncio.sleep):
+        self.s,self.clock,self.sleep=store,clock,sleep
+        self.locks=defaultdict(asyncio.Lock)
+        self.next_call=defaultdict(float)
+        self.messages=defaultdict(deque)
+        self.global_lock=asyncio.Lock()
+        self.global_next=0
+
+    def cooldown(self,scope):
+        until=0
+        for key in {str(scope),'bot'}:
+            row=self.s.one('SELECT value FROM meta WHERE key=?',('tg_pause:'+key,))
+            if row: until=max(until,float(row['value']))
+        return max(0,until-self.clock())
+
+    def pause(self,scope,seconds):
+        key='tg_pause:'+str(scope)
+        old=self.s.one('SELECT value FROM meta WHERE key=?',(key,))
+        due=max(float(old['value']) if old else 0,self.clock()+seconds+1)
+        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(key,str(due)))
+
+    async def __call__(self,make_request,bot,method):
+        name=method.__api_method__
+        if name=='getUpdates': return await make_request(bot,method)
+        chat=getattr(method,'chat_id',None)
+        scope=str(chat) if chat is not None else 'bot'
+        group=chat is not None and (not isinstance(chat,int) or chat<0)
+        output=name.startswith(('send','copy','forward')) and name!='sendChatAction'
+        units=len(getattr(method,'media',None) or getattr(method,'message_ids',None) or [1]) if output else 0
+        if BACKGROUND_REQUEST.get() and self.locks[scope].locked():
+            raise TelegramRetryAfter(method=method,message='Chat request in progress',retry_after=max(1,math.ceil(self.cooldown(scope))))
+        async with self.locks[scope]:
+            while True:
+                pause=self.cooldown(scope)
+                if pause and BACKGROUND_REQUEST.get():
+                    raise TelegramRetryAfter(method=method,message='Stored Telegram cooldown',retry_after=math.ceil(pause))
+                now=self.clock(); wait=max(pause,self.next_call[scope]-now,0)
+                history=self.messages[scope]
+                while history and history[0][0]<=now-61: history.popleft()
+                if group and units:
+                    count=sum(n for _,n in history)
+                    for when,n in history:
+                        if count+units<=20: break
+                        wait=max(wait,when+61-now); count-=n
+                if wait>0:
+                    if BACKGROUND_REQUEST.get() and wait>1:
+                        raise TelegramRetryAfter(method=method,message='Local request budget',retry_after=math.ceil(wait))
+                    await self.sleep(min(wait,30)); continue
+                async with self.global_lock:
+                    wait=self.global_next-self.clock()
+                    if wait>0: await self.sleep(wait)
+                    self.global_next=self.clock()+0.04
+                interval=3.1*units if group and output else 1.05 if chat is not None and not group and (output or name.startswith('editMessage')) else 0.1
+                self.next_call[scope]=self.clock()+interval
+                try:
+                    result=await make_request(bot,method)
+                except TelegramRetryAfter as e:
+                    self.pause(scope,e.retry_after)
+                    log.info('Telegram cooldown: method=%s chat=%s seconds=%s',name,scope,e.retry_after)
+                    if BACKGROUND_REQUEST.get(): raise
+                    continue
+                if group and units: history.append((self.clock(),units))
+                return result
 
 
 def keyboard(rows):
@@ -90,9 +164,10 @@ def payload(m):
 
 
 class App:
-    def __init__(self, store, bot, forum, admins, owner=None, reviews_chat=None):
+    def __init__(self, store, bot, forum, admins, owner=None, reviews_chat=None, rate_guard=None):
         self.s,self.bot,self.forum,self.admins,self.owner = store,bot,forum,set(admins),owner
         self.reviews_chat=reviews_chat
+        self.rate_guard=rate_guard
         if reviews_chat and reviews_chat==forum:
             raise ValueError('Группа отзывов должна отличаться от рабочей группы.')
         self.locks = defaultdict(asyncio.Lock)
@@ -105,9 +180,43 @@ class App:
         r.errors.register(self.handler_error)
 
     async def handler_error(self,event: ErrorEvent):
+        if isinstance(event.exception,TelegramRetryAfter):
+            log.info('Action deferred by Telegram for %s seconds',event.exception.retry_after)
+            return True
         log.error('Update handler failed: %s',type(event.exception).__name__)
         await self.alert('⚠️ Ошибка обработки действия. Проверьте журнал запуска. Сохранённые сообщения остаются в очереди.')
         return True
+
+    def ready_jobs(self,prefix,limit=3):
+        jobs=[]
+        for row in self.s.all('SELECT * FROM meta WHERE key LIKE ?',(prefix+':%',)):
+            try: data=json.loads(row['value'])
+            except (ValueError,TypeError): data={}
+            if not isinstance(data,dict): data={}
+            if data.get('due',0)<=time.time(): jobs.append(row)
+            if len(jobs)>=limit: break
+        return jobs
+
+    def defer_job(self,key,error):
+        old=self.s.one('SELECT value FROM meta WHERE key=?',(key,))
+        try: job=json.loads(old['value']) if old else {}
+        except (ValueError,TypeError): job={}
+        if not isinstance(job,dict): job={}
+        tries=job.get('tries',0)+1
+        delay=error.retry_after+1 if isinstance(error,TelegramRetryAfter) else 300 if isinstance(error,TelegramForbiddenError) else min(300,2**min(tries,9))
+        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',
+            (key,json.dumps({'due':time.time()+delay,'tries':tries})))
+        if not isinstance(error,TelegramRetryAfter) and tries==1:
+            log.warning('Background job deferred: %s (%s)',key,type(error).__name__)
+
+    async def answer_callback(self,c,*args,**kwargs):
+        try: await c.answer(*args,**kwargs)
+        except TelegramBadRequest as e:
+            if not any(t in str(e).lower() for t in ('query is too old','query id is invalid','query_id_invalid')): raise
+
+    def topic_name(self,o):
+        u=self.s.user(o['user_id'])
+        return f"{self.label(o)} · {u['name'][:40]} · {o['work'][:30]}"[:128]
 
     def menu_keys(self):
         return keyboard([[('📝 Новая заявка','new'),('📂 Мои заказы','mine:0')],
@@ -216,16 +325,21 @@ class App:
 
     async def ensure_topic(self,oid):
         o=self.s.order(oid)
+        if self.unavailable(o): return
         if not o['thread']:
-            u=self.s.user(o['user_id'])
-            t=await self.bot.create_forum_topic(self.forum,name=f"{self.label(o)} · {u['name']}"[:128])
+            self.s.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',(f'provision:{oid}','1'))
+            name=self.topic_name(o)
+            t=await self.bot.create_forum_topic(self.forum,name=name)
             self.s.set_order(oid,thread=t.message_thread_id)
-        await self.card(oid)
+            self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',
+                (f'topicname:{oid}',json.dumps([self.forum,t.message_thread_id,name])))
+        if not self.s.order(oid)['card']: await self.card(oid)
         if not self.s.one('SELECT value FROM meta WHERE key=?',(f'announced:{oid}',)):
             o=self.s.order(oid)
             await self.bot.send_message(self.forum,f'🆕 {self.label(o)}',message_thread_id=o['thread'])
             self.s.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',(f'announced:{oid}','1'))
             self.s.event(oid,'notified')
+        self.s.execute('DELETE FROM meta WHERE key=?',(f'provision:{oid}',))
 
     def card_text(self,o,client=False):
         u=self.s.user(o['user_id'])
@@ -274,10 +388,12 @@ class App:
         else:
             msg=await self.bot.send_message(text=text,**opts)
         self.s.set_order(oid,card=msg.message_id,photo=int(bool(photo)))
+        self.s.schedule(f'pin:{oid}')
         try:
             await self.bot.pin_chat_message(self.forum,msg.message_id,disable_notification=True)
-        except TelegramBadRequest:
-            log.warning('Cannot pin order %s',oid)
+            self.s.execute('DELETE FROM meta WHERE key=?',(f'pin:{oid}',))
+        except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter) as e:
+            self.defer_job(f'pin:{oid}',e)
 
     async def form(self,oid):
         o=self.s.order(oid)
@@ -334,9 +450,9 @@ class App:
                 value='Да · '+match[1].replace(',','.')+'%'
             else: value='Да · процент не уточнён'
         self.s.set_order(o['id'],**{field:value},step=7 if step==3 and value=='Да' else 4 if step==7 else step+1,date_manual=0)
+        if field=='work' and value!=o['work']: self.s.schedule(f'rename:{o["id"]}',2)
+        self.s.schedule(f'carddirty:{o["id"]}')
         await self.form(o['id'])
-        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'rename:{o["id"]}','1'))
-        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'carddirty:{o["id"]}','1'))
 
     async def receipt(self,oid):
         o=self.s.order(oid)
@@ -431,9 +547,8 @@ class App:
         if cmd=='/number':
             try:
                 self.s.number(o['id'],text.partition(' ')[2].strip())
-                await self.rename(o['id'])
-                await self.card(o['id'])
-                await m.answer('Номер сохранён, название темы и карточка обновлены.',disable_notification=True)
+                self.s.schedule(f'carddirty:{o["id"]}')
+                await m.answer('Номер сохранён. Название темы и карточка обновятся автоматически с учётом ограничений Telegram.',disable_notification=True)
             except ValueError as e:
                 await m.answer(str(e),disable_notification=True)
             return
@@ -497,10 +612,10 @@ class App:
             async with self.locks[uid]:
                 await self.dispatch_callback(c)
         except ValueError as e:
-            await c.answer(str(e)[:180],show_alert=True)
+            await self.answer_callback(c,str(e)[:180],show_alert=True)
         except (TelegramBadRequest,TelegramForbiddenError):
             log.exception('Callback failed')
-            await c.answer('Действие не выполнено. Откройте меню и повторите.',show_alert=True)
+            await self.answer_callback(c,'Действие не выполнено. Откройте меню и повторите.',show_alert=True)
 
     async def dispatch_callback(self,c):
         data=c.data or ''
@@ -509,12 +624,12 @@ class App:
         if not private:
             if c.message.chat.id!=self.forum or uid not in self.admins:
                 raise ValueError('Доступ только менеджеру')
-            await c.answer()
+            await self.answer_callback(c)
             await self.admin_callback(c,data); return
         self.s.upsert_user(c.from_user)
         if self.s.user(uid)['blocked']:
             raise ValueError('Доступ ограничен. Свяжитесь с OneStudy другим способом.')
-        await c.answer()
+        await self.answer_callback(c)
         mid=getattr(c.message,'message_id',None)
         screen=self.s.one('SELECT mid FROM screens WHERE uid=?',(uid,))
         if isinstance(mid,int) and screen and data.split(':')[0] in ('new','confirmnew','talk','mine','view','select','faq','publish','reviewcancel') and screen['mid']!=mid:
@@ -596,7 +711,7 @@ class App:
             if data.startswith('editform:'): await self.form(oid)
             else:
                 self.s.set_order(oid,waiting=o['waiting'] or time.time(),activity=time.time())
-                self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'carddirty:{oid}','1'))
+                self.s.schedule(f'carddirty:{oid}')
                 await self.receipt(oid)
         elif data.startswith(('finish:','nofiles:')):
             oid=int(data.split(':')[1]); o=self.current(uid,oid)
@@ -727,12 +842,17 @@ class App:
             self.s.execute('DELETE FROM meta WHERE key=?',(f'rename:{oid}',))
             return
         if not o['thread']: return
-        u=self.s.user(o['user_id'])
-        name=f"{self.label(o)} · {u['name'][:40]} · {o['work'][:30]}"[:128]
+        name=self.topic_name(o)
+        saved=json.dumps([self.forum,o['thread'],name])
+        cached=self.s.one('SELECT value FROM meta WHERE key=?',(f'topicname:{oid}',))
+        if cached and cached['value']==saved:
+            self.s.execute('DELETE FROM meta WHERE key=?',(f'rename:{oid}',)); return
         try: await self.bot.edit_forum_topic(self.forum,o['thread'],name=name)
         except TelegramBadRequest as e:
             if 'not modified' not in str(e): raise
-        self.s.execute('DELETE FROM meta WHERE key=?',(f'rename:{oid}',))
+        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'topicname:{oid}',saved))
+        if self.topic_name(self.s.order(oid))==name:
+            self.s.execute('DELETE FROM meta WHERE key=?',(f'rename:{oid}',))
 
     async def publish_reviews(self):
         if not self.reviews_chat: return
@@ -744,11 +864,11 @@ class App:
                     link_preview_options=LinkPreviewOptions(is_disabled=True))
                 self.s.execute("UPDATE reviews SET state='sent' WHERE oid=?",(r['oid'],))
             except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter) as e:
-                tries=r['tries']+1
+                tries=r['tries']+(0 if isinstance(e,TelegramRetryAfter) else 1)
                 delay=e.retry_after+1 if isinstance(e,TelegramRetryAfter) else min(300,2**tries)
                 self.s.execute('UPDATE reviews SET state=?,tries=?,due=? WHERE oid=?',
-                    ('failed' if tries>=8 else 'pending',tries,time.time()+delay,r['oid']))
-                if tries==1: await self.alert('⚠️ Не удалось опубликовать анонимный отзыв. Проверьте REVIEWS_CHAT_ID и права бота.')
+                    ('failed' if tries>=8 and not isinstance(e,TelegramRetryAfter) else 'pending',tries,time.time()+delay,r['oid']))
+                if tries==1 and not isinstance(e,TelegramRetryAfter): await self.alert('⚠️ Не удалось опубликовать анонимный отзыв. Проверьте REVIEWS_CHAT_ID и права бота.')
 
     async def fallback_send(self,row,target,thread,silent):
         d=json.loads(row['payload']); kind=d.get('kind'); opts=dict(chat_id=target,disable_notification=silent)
@@ -767,6 +887,8 @@ class App:
         try:
             await self.bot.send_message(self.owner or self.forum,text,
                 message_thread_id=o['thread'] if o and not self.owner else None)
+        except TelegramRetryAfter:
+            log.info('Admin alert deferred by Telegram')
         except Exception:
             log.error('Unable to deliver admin alert')
 
@@ -829,35 +951,46 @@ class App:
             later=self.s.one("SELECT MIN(created) t FROM queue WHERE oid=? AND direction='in' AND created>?",(o['id'],max(x['created'] for x in rows)))['t']
             self.s.set_order(o['id'],waiting=later,reminded=0,activity=time.time())
         # Card UI errors are not message delivery errors.
-        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'carddirty:{o["id"]}','1'))
+        self.s.schedule(f'carddirty:{o["id"]}')
 
     async def tick(self):
         await self.publish_reviews()
-        for item in self.s.all("SELECT key FROM meta WHERE key LIKE 'rename:%' LIMIT 3"):
+        for item in self.ready_jobs('rename'):
             try: await self.rename(int(item['key'].split(':')[1]))
-            except (TelegramBadRequest,TelegramNetworkError,TelegramRetryAfter) as e:
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter) as e:
                 if self.is_missing_topic(e): await self.missing_topic(self.s.order(int(item['key'].split(':')[1])))
-                else: log.warning('Topic rename deferred')
-        for o in self.s.all("SELECT * FROM orders WHERE thread IS NULL AND status NOT IN ('archive','cancelled','done') LIMIT 5"):
+                else: self.defer_job(item['key'],e)
+        for o in self.s.all("SELECT * FROM orders WHERE (thread IS NULL OR EXISTS(SELECT 1 FROM meta m WHERE m.key='provision:' || orders.id)) AND status NOT IN ('archive','cancelled','done') LIMIT 5"):
             try: await self.ensure_topic(o['id'])
+            except TelegramRetryAfter: pass
             except Exception:
                 log.exception('Topic creation delayed for order %s',o['id'])
-        for item in self.s.all("SELECT key FROM meta WHERE key LIKE 'carddirty:%' LIMIT 3"):
+        for item in self.ready_jobs('carddirty'):
             oid=int(item['key'].split(':')[1])
             try:
                 await self.card(oid)
-                if self.s.order(oid)['thread']: self.s.execute('DELETE FROM meta WHERE key=?',(item['key'],))
+                if self.s.order(oid)['thread']: self.s.execute('DELETE FROM meta WHERE key=? AND value=?',(item['key'],item['value']))
             except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter,TelegramNetworkError) as e:
                 if self.is_missing_topic(e): await self.missing_topic(self.s.order(oid))
-                else: log.warning('Card refresh deferred for order %s',oid)
+                else: self.defer_job(item['key'],e)
+        for item in self.ready_jobs('pin'):
+            o=self.s.order(int(item['key'].split(':')[1]))
+            if not o or not o['card'] or self.unavailable(o) or o['status'] in TERMINAL:
+                self.s.execute('DELETE FROM meta WHERE key=?',(item['key'],)); continue
+            try:
+                await self.bot.pin_chat_message(self.forum,o['card'],disable_notification=True)
+                self.s.execute('DELETE FROM meta WHERE key=?',(item['key'],))
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter) as e:
+                self.defer_job(item['key'],e)
         rows=self.s.next_batch()
         if rows:
             try: await self.deliver(rows)
             except Exception as e:
                 if self.is_missing_topic(e): await self.missing_topic(self.s.order(rows[0]['oid']))
                 permanent=isinstance(e,(TelegramForbiddenError,ValueError))
-                tries=rows[0]['tries']+1
-                failed=permanent or tries>=8
+                limited=isinstance(e,TelegramRetryAfter)
+                tries=rows[0]['tries']+(0 if limited else 1)
+                failed=not limited and (permanent or tries>=8)
                 delay=e.retry_after+1 if isinstance(e,TelegramRetryAfter) else min(300,2**tries)
                 for row in rows:
                     # A card refresh failure after delivery must never resend the content.
@@ -876,7 +1009,8 @@ class App:
                     if o['delay_admin']:
                         await self.remove(self.owner or self.forum,o['delay_admin'])
                         self.s.set_order(o['id'],delay_admin=None)
-                except (TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
+                except TelegramRetryAfter: pass
+                except (TelegramForbiddenError,TelegramNetworkError):
                     log.warning('Recovery notice update deferred')
         for o in self.s.all('SELECT * FROM orders WHERE finish=1'):
             if self.unavailable(o) or o['status'] in ('archive','cancelled'): continue
@@ -892,6 +1026,7 @@ class App:
                     await self.alert(f"Не удалось обновить подтверждение заказа {self.label(o)}",o['id'])
             except TelegramForbiddenError:
                 await self.alert(f"Клиент заказа {self.label(o)} недоступен для подтверждения.",o['id'])
+            except TelegramRetryAfter: continue
             self.s.set_order(o['id'],finish=0,batch=0,step=-1)
         for item in self.s.all("SELECT * FROM meta WHERE key LIKE 'close:%' LIMIT 5"):
             oid=int(item['key'].split(':')[1]); o=self.s.order(oid)
@@ -923,7 +1058,7 @@ class App:
                 await self.maintain_order(o,now)
             except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter) as e:
                 if self.is_missing_topic(e): await self.missing_topic(o)
-                else: log.warning('Maintenance deferred for internal order %s: %s',o['id'],type(e).__name__)
+                elif not isinstance(e,TelegramRetryAfter): log.warning('Maintenance deferred for internal order %s: %s',o['id'],type(e).__name__)
 
     async def maintain_order(self,o,now):
         if o['thread'] and o['waiting'] and now-o['waiting']>=1800 and not o['reminded']:
@@ -938,9 +1073,16 @@ class App:
 
     async def guide(self):
         if self.s.one("SELECT value FROM meta WHERE key='guide_v33'"): return
-        t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3.3')
-        msg=await self.bot.send_message(self.forum,
-          '<b>OneStudy v3.3 · менеджеру</b>\n\n'
+        thread=self.s.one("SELECT value FROM meta WHERE key='guide_thread_v34'")
+        if not thread:
+            t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3.4')
+            self.s.execute("INSERT INTO meta VALUES('guide_thread_v34',?)",(str(t.message_thread_id),))
+            thread={'value':str(t.message_thread_id)}
+        tid=int(thread['value'])
+        saved=self.s.one("SELECT value FROM meta WHERE key='guide_msg_v34'")
+        if not saved:
+            msg=await self.bot.send_message(self.forum,
+          '<b>OneStudy v3.4 · менеджеру</b>\n\n'
           'В /orders нажмите заявку: откроются переход в переписку и закрытие в архив. '
           'Архив из списка не уведомляет клиента и работает даже с удалённой темой.\n\n'
           'Анкета: дата кнопкой или вручную → антиплагиат Да/Нет/Не знаю → '
@@ -960,12 +1102,15 @@ class App:
           'Рабочие заказы автоматически не закрываются.\n'
           'При ошибке доставки проверьте права и доступность клиента, затем используйте /retry.\n'
           'При частично переданном альбоме сначала проверьте тему: повтор может создать дубли.',
-          message_thread_id=t.message_thread_id,disable_notification=True,
+          message_thread_id=tid,disable_notification=True,
           reply_markup=keyboard([[('📋 Заказы','dash:all:0')]]))
-        await self.bot.pin_chat_message(self.forum,msg.message_id,disable_notification=True)
-        self.s.execute("INSERT INTO meta VALUES('guide_v33',?)",(str(t.message_thread_id),))
+            self.s.execute("INSERT INTO meta VALUES('guide_msg_v34',?)",(str(msg.message_id),))
+            saved={'value':str(msg.message_id)}
+        await self.bot.pin_chat_message(self.forum,int(saved['value']),disable_notification=True)
+        self.s.execute("INSERT OR REPLACE INTO meta VALUES('guide_v33',?)",(str(tid),))
 
     async def worker(self):
+        BACKGROUND_REQUEST.set(True)
         last_maintenance=0; last_backup=0
         while True:
             try:
@@ -980,6 +1125,8 @@ class App:
                         await self.bot.send_document(self.owner,FSInputFile(path),caption='Резервная копия OneStudy. Содержит данные клиентов.',disable_notification=True)
                     last_backup=now
             except asyncio.CancelledError: raise
+            except TelegramRetryAfter:
+                log.info('Worker request deferred by Telegram')
             except Exception:
                 log.exception('Worker cycle failed')
             await asyncio.sleep(1.2)
@@ -987,6 +1134,7 @@ class App:
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    log.info('Starting OneStudy v3.4')
     token=os.environ.get('BOT_TOKEN'); forum=int(os.environ.get('FORUM_CHAT_ID','0'))
     admins={int(x.strip()) for x in os.environ.get('ADMIN_IDS','').split(',') if x.strip()}
     if not token or not forum or not admins:
@@ -998,6 +1146,8 @@ async def main():
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     store=Store(folder/'threads.db')
     bot=Bot(token,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    rate_guard=RateGuard(store)
+    bot.session.middleware(rate_guard)
     worker=None
     try:
         me=await bot.get_me(); chat=await bot.get_chat(forum)
@@ -1010,10 +1160,12 @@ async def main():
         await bot.set_my_commands([BotCommand(command='start',description='Главное меню')])
         owner=int(os.environ.get('OWNER_CHAT_ID','0')) or None
         reviews_chat=int(os.environ.get('REVIEWS_CHAT_ID','0')) or None
-        app=App(store,bot,forum,admins,owner,reviews_chat)
+        app=App(store,bot,forum,admins,owner,reviews_chat,rate_guard)
+        context_token=BACKGROUND_REQUEST.set(True)
         try: await app.guide()
-        except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError):
+        except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
             log.warning('Не удалось создать служебную инструкцию; см. README.md')
+        finally: BACKGROUND_REQUEST.reset(context_token)
         dp=Dispatcher(); dp.include_router(app.router)
         worker=asyncio.create_task(app.worker())
         # Sequential update handling: persist every message before requesting more updates.

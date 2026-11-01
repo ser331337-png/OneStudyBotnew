@@ -68,6 +68,14 @@ class Store:
             self.c.execute('DELETE FROM screens')
             self.c.execute("INSERT INTO meta VALUES('migration_v32','1')")
         self.migrate()
+        if not self.c.execute("SELECT 1 FROM meta WHERE key='rate_recovery_v34'").fetchone():
+            # Previous versions counted explicit quota rejections as failed
+            # delivery attempts. Only recover that known rejection, once.
+            self.c.execute("""UPDATE queue SET state='pending',tries=0,alerted=0
+              WHERE state='failed' AND error='TelegramRetryAfter' AND EXISTS(
+                SELECT 1 FROM orders o WHERE o.id=queue.oid
+                AND o.status NOT IN ('archive','cancelled'))""")
+            self.c.execute("INSERT INTO meta VALUES('rate_recovery_v34','1')")
         self.c.commit()
 
     def execute(self, sql, args=()):
@@ -148,6 +156,14 @@ class Store:
         self.execute('INSERT INTO events(oid,action,created) VALUES(?,?,?)',
                      (oid,action,time.time()))
 
+    def schedule(self, key, delay=0):
+        old=self.one('SELECT value FROM meta WHERE key=?',(key,))
+        try: job=json.loads(old['value']) if old else {}
+        except (ValueError,TypeError): job={}
+        if not isinstance(job,dict): job={}
+        job['due']=max(job.get('due',0),time.time()+delay)
+        self.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(key,json.dumps(job)))
+
     def number(self, oid, value):
         if not value.isascii() or not value.isdigit() or not 1<=int(value)<=999999999:
             raise ValueError('Пример: /number 125. Нужен положительный номер до 9 цифр.')
@@ -157,7 +173,7 @@ class Store:
         except sqlite3.IntegrityError:
             raise ValueError('Этот номер уже занят другим заказом.') from None
         self.event(oid,'Назначен номер '+value)
-        self.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'rename:{oid}','1'))
+        self.schedule(f'rename:{oid}')
 
     def claim(self, chat, mid, action):
         return bool(self.execute('INSERT OR IGNORE INTO actions VALUES(?,?,?)',
