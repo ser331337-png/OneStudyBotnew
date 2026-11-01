@@ -1,4 +1,4 @@
-"""OneStudy v3: one process, persistent inbox/outbox and multiple orders."""
+"""OneStudy v3.3: one process, persistent inbox/outbox and multiple orders."""
 from __future__ import annotations
 import asyncio
 from collections import defaultdict
@@ -116,6 +116,29 @@ class App:
     def label(self,o):
         return 'Заказ №'+o['number'] if o.get('number') else 'Заявка от '+datetime.fromtimestamp(o['created'],ZoneInfo('Europe/Moscow')).strftime('%d.%m %H:%M')
 
+    def unavailable(self,o):
+        item=self.s.one('SELECT value FROM meta WHERE key=?',(f'unavailable:{o["id"]}',))
+        return bool(item and item['value']==f"{self.forum}:{o['thread']}")
+
+    async def missing_topic(self,o):
+        if self.unavailable(o): return
+        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',
+                       (f'unavailable:{o["id"]}',f"{self.forum}:{o['thread']}"))
+        self.s.execute('DELETE FROM meta WHERE key=?',(f'rename:{o["id"]}',))
+        log.warning('Missing topic recorded for internal order %s',o['id'])
+        # Do not post into the missing topic. Notify only in an available chat.
+        try:
+            await self.bot.send_message(self.owner or self.forum,
+              f'⚠️ Недоступна переписка: {self.label(o)}. Проверьте FORUM_CHAT_ID. '
+              'Тестовую заявку можно закрыть в архив через /orders. Данные сохранены.',disable_notification=True)
+        except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
+            log.warning('Missing-topic notice could not be delivered')
+
+    @staticmethod
+    def is_missing_topic(error):
+        return isinstance(error,TelegramBadRequest) and any(t in str(error).lower() for t in
+            ('message thread not found','topic_id_invalid','topic not found'))
+
     async def remove(self,chat,mid):
         if not mid: return
         try:
@@ -220,7 +243,7 @@ class App:
 
     async def card(self,oid):
         o=self.s.order(oid)
-        if not o['thread']:
+        if not o['thread'] or self.unavailable(o):
             return
         text=self.card_text(o)
         markup=keyboard([[('Статус',f'status:{oid}'),('Карточка',f'card:{oid}')],
@@ -440,11 +463,9 @@ class App:
     async def send_order_list(self,chat,orders,title,extra=None,edit=None):
         rows=[]
         for o in orders:
-            if o['thread']:
-                url=f"https://t.me/c/{str(self.forum).removeprefix('-100')}/{o['thread']}"
-                u=self.s.user(o['user_id'])
-                wait=f" · ждёт {int((time.time()-o['waiting'])/60)} мин" if o['waiting'] else ''
-                rows.append([InlineKeyboardButton(text=f"{self.label(o)} · {u['name'][:22]}{wait}",url=url)])
+            u=self.s.user(o['user_id'])
+            wait=f" · ждёт {int((time.time()-o['waiting'])/60)} мин" if o['waiting'] else ''
+            rows.append([InlineKeyboardButton(text=f"{self.label(o)} · {u['name'][:22]}{wait}",callback_data=f'adminorder:{o["id"]}')])
         if extra: rows.extend(extra)
         text=title if orders else title+'\nЗаказов нет.'
         markup=InlineKeyboardMarkup(inline_keyboard=rows)
@@ -634,7 +655,40 @@ class App:
         if len(parts)<2 or not parts[1].isdigit(): return
         oid=int(parts[1]); o=self.s.order(oid)
         if not o: raise ValueError('Заказ не найден')
-        if parts[0]=='status':
+        if parts[0]=='adminorder':
+            text=self.card_text(o)
+            markup=keyboard([[('📁 Закрыть заявку',f'archiveask:{oid}')],[('⬅️ Назад к списку','dash:all:0')]])
+            if o['thread'] and not self.unavailable(o):
+                url=f"https://t.me/c/{str(self.forum).removeprefix('-100')}/{o['thread']}"
+                markup.inline_keyboard.insert(0,[InlineKeyboardButton(text='💬 Перейти в переписку',url=url)])
+            else: text+='\n\n⚠️ Переписка недоступна или ещё не создана. Закрытие в архив доступно.'
+            await c.message.edit_text(text,reply_markup=markup)
+        elif parts[0]=='archiveask':
+            count=self.s.one("SELECT COUNT(*) n FROM queue WHERE oid=? AND state!='sent'",(oid,))['n']
+            text=f'Закрыть в архив: {self.label(o)}?\nКлиенту не придёт сообщение или запрос оценки. Напоминания прекратятся.'
+            if count: text+=f'\nЕсть недоставленные сообщения: {count}. Они сохранятся в базе, но их передача будет приостановлена.'
+            await c.message.edit_text(text,reply_markup=keyboard([[('📁 Да, закрыть',f'archiveconfirm:{oid}')],[('Отмена',f'adminorder:{oid}')]]))
+        elif parts[0]=='archiveconfirm':
+            if o['status']=='archive':
+                await c.message.edit_text('📁 Заявка уже в архиве.',reply_markup=keyboard([[('⬅️ К активным заявкам','dash:all:0')]]))
+                return
+            # Commit locally; a missing/deleted topic must not prevent closing.
+            with self.s.c:
+                self.s.c.execute("UPDATE orders SET status='archive',waiting=NULL,finish=0,step=-1 WHERE id=?",(oid,))
+                self.s.c.execute('DELETE FROM meta WHERE key IN (?,?,?,?)',
+                    (f'rename:{oid}',f'carddirty:{oid}',f'close:{oid}',f'failed_close:{oid}'))
+                self.s.c.execute('INSERT INTO events(oid,action,created) VALUES(?,?,?)',
+                    (oid,'Закрыто в архив из сводки без уведомления клиента',time.time()))
+            await c.message.edit_text('📁 Заявка закрыта в архив. Данные сохранены, клиент не уведомлён.',
+                reply_markup=keyboard([[('⬅️ К активным заявкам','dash:all:0')]]))
+            if o['thread'] and not self.unavailable(o):
+                try: await self.card(oid)
+                except TelegramBadRequest as e:
+                    if self.is_missing_topic(e): await self.missing_topic(o)
+                    else: log.warning('Archived card update deferred')
+                except (TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
+                    log.warning('Archived card update deferred')
+        elif parts[0]=='status':
             await c.message.reply('Выберите статус:',reply_markup=keyboard([[(v,f'set:{oid}:{k}')] for k,v in STATUSES.items() if k!='done']),disable_notification=True)
         elif parts[0]=='set':
             status=parts[2]
@@ -654,6 +708,8 @@ class App:
             await self.remove(self.forum,getattr(c.message,'message_id',None))
         elif parts[0]=='confirm':
             if o['status']=='done': return
+            if o['status'] in ('archive','cancelled'):
+                raise ValueError('Заявка закрыта. Старую кнопку завершения использовать нельзя.')
             if self.s.one("SELECT id FROM queue WHERE oid=? AND state!='sent' LIMIT 1",(oid,)):
                 raise ValueError('Сначала дождитесь передачи сообщений или исправьте ошибку через /retry.')
             # Commit status and outgoing notice together, before the Telegram call.
@@ -667,6 +723,9 @@ class App:
 
     async def rename(self,oid):
         o=self.s.order(oid)
+        if self.unavailable(o):
+            self.s.execute('DELETE FROM meta WHERE key=?',(f'rename:{oid}',))
+            return
         if not o['thread']: return
         u=self.s.user(o['user_id'])
         name=f"{self.label(o)} · {u['name'][:40]} · {o['work'][:30]}"[:128]
@@ -736,6 +795,7 @@ class App:
 
     async def deliver(self,rows):
         r=rows[0]; o=self.s.order(r['oid'])
+        if self.unavailable(o): raise ValueError('Рабочая тема недоступна; данные сохранены')
         if not o['thread']: await self.ensure_topic(o['id']); o=self.s.order(o['id'])
         inbound=r['direction']=='in'
         target=self.forum if inbound else o['user_id']; thread=o['thread'] if inbound else None
@@ -775,9 +835,10 @@ class App:
         await self.publish_reviews()
         for item in self.s.all("SELECT key FROM meta WHERE key LIKE 'rename:%' LIMIT 3"):
             try: await self.rename(int(item['key'].split(':')[1]))
-            except (TelegramBadRequest,TelegramNetworkError,TelegramRetryAfter):
-                log.warning('Topic rename deferred')
-        for o in self.s.all('SELECT * FROM orders WHERE thread IS NULL LIMIT 5'):
+            except (TelegramBadRequest,TelegramNetworkError,TelegramRetryAfter) as e:
+                if self.is_missing_topic(e): await self.missing_topic(self.s.order(int(item['key'].split(':')[1])))
+                else: log.warning('Topic rename deferred')
+        for o in self.s.all("SELECT * FROM orders WHERE thread IS NULL AND status NOT IN ('archive','cancelled','done') LIMIT 5"):
             try: await self.ensure_topic(o['id'])
             except Exception:
                 log.exception('Topic creation delayed for order %s',o['id'])
@@ -786,12 +847,14 @@ class App:
             try:
                 await self.card(oid)
                 if self.s.order(oid)['thread']: self.s.execute('DELETE FROM meta WHERE key=?',(item['key'],))
-            except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter,TelegramNetworkError):
-                log.warning('Card refresh deferred for order %s',oid)
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter,TelegramNetworkError) as e:
+                if self.is_missing_topic(e): await self.missing_topic(self.s.order(oid))
+                else: log.warning('Card refresh deferred for order %s',oid)
         rows=self.s.next_batch()
         if rows:
             try: await self.deliver(rows)
             except Exception as e:
+                if self.is_missing_topic(e): await self.missing_topic(self.s.order(rows[0]['oid']))
                 permanent=isinstance(e,(TelegramForbiddenError,ValueError))
                 tries=rows[0]['tries']+1
                 failed=permanent or tries>=8
@@ -816,6 +879,7 @@ class App:
                 except (TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
                     log.warning('Recovery notice update deferred')
         for o in self.s.all('SELECT * FROM orders WHERE finish=1'):
+            if self.unavailable(o) or o['status'] in ('archive','cancelled'): continue
             if self.s.user(o['user_id'])['selected']!=o['id']: continue
             if self.s.pending(o['id']): continue
             if not o['thread'] or not o['card'] or self.s.one('SELECT value FROM meta WHERE key=?',(f'carddirty:{o["id"]}',)):
@@ -854,21 +918,31 @@ class App:
     async def maintenance(self):
         now=time.time()
         for o in self.s.all("SELECT * FROM orders WHERE status NOT IN ('done','cancelled','archive')"):
-            if o['thread'] and o['waiting'] and now-o['waiting']>=1800 and not o['reminded']:
-                await self.bot.send_message(self.forum,f"⏰ Клиент по заказу {self.label(o)} ждёт ответа.",message_thread_id=o['thread'])
-                self.s.set_order(o['id'],reminded=1)
-            days=(now-o['activity'])/86400
-            if days>=30 and o['status'] in ('new','clarify') and not self.s.pending(o['id']):
-                self.s.set_order(o['id'],status='archive'); self.s.event(o['id'],'Архив по неактивности'); await self.card(o['id'])
-            elif days>=7 and not o['warned'] and o['thread']:
-                await self.bot.send_message(self.forum,'⚠️ Нет переписки 7 дней. Проверьте состояние заказа.',message_thread_id=o['thread'],disable_notification=True)
-                self.s.set_order(o['id'],warned=1)
+            if self.unavailable(o): continue
+            try:
+                await self.maintain_order(o,now)
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter) as e:
+                if self.is_missing_topic(e): await self.missing_topic(o)
+                else: log.warning('Maintenance deferred for internal order %s: %s',o['id'],type(e).__name__)
+
+    async def maintain_order(self,o,now):
+        if o['thread'] and o['waiting'] and now-o['waiting']>=1800 and not o['reminded']:
+            await self.bot.send_message(self.forum,f"⏰ Клиент по заказу {self.label(o)} ждёт ответа.",message_thread_id=o['thread'])
+            self.s.set_order(o['id'],reminded=1)
+        days=(now-o['activity'])/86400
+        if days>=30 and o['status'] in ('new','clarify') and not self.s.pending(o['id']):
+            self.s.set_order(o['id'],status='archive'); self.s.event(o['id'],'Архив по неактивности'); await self.card(o['id'])
+        elif days>=7 and not o['warned'] and o['thread']:
+            await self.bot.send_message(self.forum,'⚠️ Нет переписки 7 дней. Проверьте состояние заказа.',message_thread_id=o['thread'],disable_notification=True)
+            self.s.set_order(o['id'],warned=1)
 
     async def guide(self):
-        if self.s.one("SELECT value FROM meta WHERE key='guide_v32'"): return
-        t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3.2')
+        if self.s.one("SELECT value FROM meta WHERE key='guide_v33'"): return
+        t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3.3')
         msg=await self.bot.send_message(self.forum,
-          '<b>OneStudy v3.2 · менеджеру</b>\n\n'
+          '<b>OneStudy v3.3 · менеджеру</b>\n\n'
+          'В /orders нажмите заявку: откроются переход в переписку и закрытие в архив. '
+          'Архив из списка не уведомляет клиента и работает даже с удалённой темой.\n\n'
           'Анкета: дата кнопкой или вручную → антиплагиат Да/Нет/Не знаю → '
           'необязательный процент при Да → тема → сводка → материалы.\n'
           'Ответы анкеты сохраняются в карточке, без отдельной пересылки каждого поля.\n\n'
@@ -889,7 +963,7 @@ class App:
           message_thread_id=t.message_thread_id,disable_notification=True,
           reply_markup=keyboard([[('📋 Заказы','dash:all:0')]]))
         await self.bot.pin_chat_message(self.forum,msg.message_id,disable_notification=True)
-        self.s.execute("INSERT INTO meta VALUES('guide_v32',?)",(str(t.message_thread_id),))
+        self.s.execute("INSERT INTO meta VALUES('guide_v33',?)",(str(t.message_thread_id),))
 
     async def worker(self):
         last_maintenance=0; last_backup=0
@@ -898,7 +972,8 @@ class App:
                 await self.tick()
                 now=time.time()
                 if now-last_maintenance>60:
-                    await self.maintenance(); last_maintenance=now
+                    last_maintenance=now
+                    await self.maintenance()
                 if now-last_backup>86400:
                     path=self.s.backup(self.s.path.parent/'backups')
                     if self.owner:

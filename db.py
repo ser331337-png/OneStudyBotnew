@@ -187,6 +187,7 @@ class Store:
     def next_batch(self):
         # Preserve order per destination. A failed order cannot block other clients.
         r = self.one('''SELECT q.* FROM queue q WHERE state='pending' AND oid IS NOT NULL
+          AND EXISTS(SELECT 1 FROM orders o WHERE o.id=q.oid AND o.status NOT IN ('archive','cancelled'))
           AND due<=? AND NOT EXISTS(SELECT 1 FROM queue p WHERE p.id<q.id
             AND p.oid=q.oid AND p.direction=q.direction AND p.state!='sent')
           ORDER BY id LIMIT 1''',(time.time(),))
