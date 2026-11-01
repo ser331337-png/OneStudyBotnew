@@ -48,6 +48,9 @@ class Store:
         columns={r[1] for r in self.c.execute('PRAGMA table_info(orders)')}
         if 'number' not in columns:
             self.c.execute('ALTER TABLE orders ADD COLUMN number TEXT')
+        for key,definition in [('date_manual','INTEGER DEFAULT 0'),('delay_msg','INTEGER'),('delay_admin','INTEGER')]:
+            if key not in columns:
+                self.c.execute(f'ALTER TABLE orders ADD COLUMN {key} {definition}')
         self.c.executescript('''
         CREATE UNIQUE INDEX IF NOT EXISTS order_number ON orders(number) WHERE number IS NOT NULL;
         CREATE TABLE IF NOT EXISTS screens(uid INTEGER PRIMARY KEY, mid INTEGER);
@@ -56,7 +59,14 @@ class Store:
         CREATE TABLE IF NOT EXISTS review_sessions(uid INTEGER PRIMARY KEY, oid INTEGER);
         CREATE TABLE IF NOT EXISTS reviews(oid INTEGER PRIMARY KEY, body TEXT, rating INTEGER,
           state TEXT DEFAULT 'draft', due REAL DEFAULT 0, tries INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS form_inputs(src INTEGER,mid INTEGER,PRIMARY KEY(src,mid));
         ''')
+        if not self.c.execute("SELECT 1 FROM meta WHERE key='migration_v32'").fetchone():
+            # Old anti button index 0 meant 'unsure'; v3.2 index 0 means 'yes'.
+            # Retire old form pointers rather than interpreting old buttons anew.
+            self.c.execute('UPDATE orders SET form_msg=NULL,receipt=NULL,finish=0 WHERE step>=0')
+            self.c.execute('DELETE FROM screens')
+            self.c.execute("INSERT INTO meta VALUES('migration_v32','1')")
         self.migrate()
         self.c.commit()
 
@@ -108,7 +118,7 @@ class Store:
     def set_order(self, oid, **fields):
         allowed = {'thread','status','work','subject','deadline','anti','title','step',
                    'form_msg','card','photo','receipt','batch','finish','fact','rating',
-                   'review','activity','waiting','reminded','warned'}
+                   'review','activity','waiting','reminded','warned','date_manual','delay_msg','delay_admin'}
         if not fields or not set(fields) <= allowed:
             raise ValueError('Invalid order fields')
         self.execute('UPDATE orders SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',

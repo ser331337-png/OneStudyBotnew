@@ -2,7 +2,8 @@
 from __future__ import annotations
 import asyncio
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
+import calendar
 from html import escape
 import json
 import logging
@@ -34,6 +35,17 @@ QUESTIONS = ['Какая помощь нужна?','Укажите направ�
  'Укажите дату сдачи: ДД.ММ.ГГГГ. При необходимости добавьте время ЧЧ:ММ.',
  'Будет ли проверка на антиплагиат? Укажите систему и процент, если знаете.',
  'Напишите тему задания. Документы и фотографии можно отправлять сюда в любой момент.']
+ANTI=['Да','Нет','Не знаю']
+
+
+def quick_dates(today=None):
+    today=today or datetime.now(ZoneInfo('Europe/Moscow')).date()
+    result=[(name,today+timedelta(days=n)) for name,n in
+            [('Сегодня',0),('Завтра',1),('Через 3 дня',3),('Через неделю',7),('Через 2 недели',14)]]
+    year=today.year+(today.month==12); month=today.month%12+1
+    result.append(('Через месяц',today.replace(year=year,month=month,
+                  day=min(today.day,calendar.monthrange(year,month)[1]))))
+    return result
 WELCOME = 'Здравствуйте! Мы OneStudy, всегда готовы проконсультировать по учебным вопросам!\nВыберите, какая помощь нужна, или сразу напишите вопрос и прикрепите документы (при наличии).'
 FAQ = {'pay':('💳 Оплата','50% предоплата. По мере готовности показываем фрагменты работы. После согласования и оплаты остатка передаём итоговые файлы.'),
  'fix':('🛡 Доработки','Правки в рамках исходного задания — бесплатно. Новые требования и дополнительный объём обсуждаются отдельно.'),
@@ -249,10 +261,32 @@ class App:
         step=o['step']
         if step<0:
             return
-        values=WORK if step==0 else SUBJECT if step==1 else ['Не знаю / уточню позже'] if step==3 else []
+        if step==5:
+            deadline='Не указан'
+            if o['deadline']:
+                dt=datetime.fromisoformat(o['deadline'])
+                deadline=dt.strftime('%d.%m.%Y %H:%M' if dt.hour or dt.minute else '%d.%m.%Y')
+            text='<b>📋 Проверьте заявку</b>\n\n'+('\n'.join([
+                'Помощь: '+escape(o['work'] or 'Не уточнено'),
+                'Дисциплина: '+escape(o['subject'] or 'Не уточнена'),
+                'Срок: '+deadline,'Антиплагиат: '+escape(o['anti'] or 'Не уточнено'),
+                'Тема: '+escape(o['title'] or 'Не указана')]))
+            msg=await self.screen(o['user_id'],text,keyboard([[('✅ Всё верно',f'approve:{oid}'),('✏️ Исправить',f'editform:{oid}')]]))
+            self.s.set_order(oid,form_msg=msg.message_id); return
+        if step==6:
+            await self.receipt(oid); return
+        values=WORK if step==0 else SUBJECT if step==1 else ANTI if step==3 else []
         rows=[[(v,f'answer:{oid}:{step}:{i}')] for i,v in enumerate(values)]
-        rows.append([('⬅️ Назад',f'back:{oid}:{step}'),('Пропустить',f'skip:{oid}:{step}')])
-        text=f"<b>{self.label(o)} · Шаг {step+1} из 5</b>\n{QUESTIONS[step]}"
+        if step==2 and not o['date_manual']:
+            dates=[(f'{name} · {day:%d.%m}',f'date:{oid}:{day.isoformat()}') for name,day in quick_dates()]
+            rows=[dates[i:i+2] for i in range(0,len(dates),2)]
+            rows.append([('📅 Указать другую дату',f'manual:{oid}')])
+        rows.append([('⬅️ Назад',f'back:{oid}:{step}'),
+                     ('Не знаю, продолжить' if step==7 else 'Пропустить',f'skip:{oid}:{step}')])
+        question='Если знаете требуемый процент оригинальности, напишите его сюда. Например: 70%.' if step==7 else QUESTIONS[step]
+        if step==2 and not o['date_manual']: question='📅 Когда нужно подготовить работу? Выберите дату.'
+        if step==3: question='🔍 Будет ли проверка на антиплагиат?'
+        text=f"<b>Новая заявка · Шаг {4 if step==7 else step+1} из 5</b>\n{question}"
         if o['form_msg']:
             try:
                 await self.bot.edit_message_text(text,chat_id=o['user_id'],message_id=o['form_msg'],reply_markup=keyboard(rows))
@@ -263,26 +297,32 @@ class App:
         self.s.set_order(oid,form_msg=msg.message_id)
 
     async def advance(self,o,value):
-        if o['step']<0:
+        step=o['step']
+        if step not in (0,1,2,3,4,7):
             return
-        field=FIELDS[o['step']]
+        field='anti' if step==7 else FIELDS[step]
         if value and field=='deadline':
             value=date_value(value)
-        self.s.set_order(o['id'],**{field:value},step=o['step']+1 if o['step']<4 else -1)
-        if o['step']==4:
-            await self.clear_screen(o['user_id'])
-            await self.receipt(o['id'])
-        else:
-            await self.form(o['id'])
+        if step==7:
+            if value:
+                match=re.fullmatch(r'\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*%?\s*',value)
+                if not match or not 0<=float(match[1].replace(',','.'))<=100:
+                    raise ValueError('Укажите процент от 0 до 100, например 70%, или нажмите «Не знаю, продолжить».')
+                value='Да · '+match[1].replace(',','.')+'%'
+            else: value='Да · процент не уточнён'
+        self.s.set_order(o['id'],**{field:value},step=7 if step==3 and value=='Да' else 4 if step==7 else step+1,date_manual=0)
+        await self.form(o['id'])
         self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'rename:{o["id"]}','1'))
+        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'carddirty:{o["id"]}','1'))
 
     async def receipt(self,oid):
         o=self.s.order(oid)
+        if o['step'] not in (-1,6): return
         if o['receipt']:
             return
         msg=await self.bot.send_message(o['user_id'],
-          f'{self.label(o)}. Можете отправить остальные материалы сюда. Когда закончите, нажмите «Всё отправлено».',
-          reply_markup=keyboard([[('Всё отправлено',f'finish:{oid}')]]))
+          '📎 Прикрепите требования, методичку и остальные материалы. Если документов нет, можно продолжить без них.',
+          reply_markup=keyboard([[('✅ Материалы отправлены',f'finish:{oid}')],[('Без документов',f'nofiles:{oid}')]]))
         self.s.set_order(oid,receipt=msg.message_id)
 
     async def private(self,m):
@@ -322,15 +362,24 @@ class App:
                 o=None
             if not o and not orders:
                 o=await self.create(uid)
+            if o and o['form_msg'] and m.text and o['step'] in (0,1,2,3,4,7):
+                if not self.s.execute('INSERT OR IGNORE INTO form_inputs VALUES(?,?)',(m.chat.id,m.message_id)).rowcount: return
+                try:
+                    replied=m.reply_to_message
+                    if replied and replied.message_id!=o['form_msg']:
+                        raise ValueError('Это ответ на предыдущий вопрос. Ответьте на текущий экран анкеты.')
+                    if o['step']==3:
+                        raise ValueError('Выберите «Да», «Нет» или «Не знаю» кнопкой под вопросом.')
+                    if o['step']==4 and (re.fullmatch(r'\d{1,2}[./]\d{1,2}[./]\d{2,4}',m.text.strip()) or m.text.strip().lower() in ('да','нет','не знаю','да, будет')):
+                        raise ValueError('Сейчас нужна тема задания. Для изменения даты или антиплагиата нажмите «Назад».')
+                    await self.advance(o,m.text[:500])
+                except ValueError as e:
+                    await self.bot.send_message(uid,str(e),disable_notification=True)
+                return
             accepted=self.s.enqueue(m,o['id'] if o else None,'in',payload(m))
             if not accepted: return
             if not o:
                 await self.choose(uid); return
-            if o['step']>=0 and o['form_msg'] and m.text:
-                try:
-                    await self.advance(o,m.text[:500])
-                except ValueError as e:
-                    await m.answer(str(e))
             await self.receipt(o['id'])
 
     async def group(self,m):
@@ -497,14 +546,43 @@ class App:
             if isinstance(mid,int) and o['form_msg']!=mid:
                 raise ValueError('Эта анкета больше не активна. Откройте её из главного меню.')
             if parts[0]=='back':
-                self.s.set_order(oid,step=max(0,step-1)); await self.form(oid)
+                previous=3 if step==7 else (7 if step==4 and o['anti'].startswith('Да') else 3) if step==4 else max(0,step-1)
+                self.s.set_order(oid,step=previous,date_manual=0); await self.form(oid)
             else:
-                options=WORK if step==0 else SUBJECT if step==1 else ['Не знаю / уточню позже']
+                options=WORK if step==0 else SUBJECT if step==1 else ANTI if step==3 else []
+                if parts[0]=='answer' and (len(parts)!=4 or not parts[3].isdigit() or int(parts[3])>=len(options)):
+                    raise ValueError('Используйте актуальные кнопки.')
                 value=options[int(parts[3])] if parts[0]=='answer' else ''
                 await self.advance(o,value)
-        elif data.startswith('finish:'):
+        elif data.startswith(('date:','manual:')):
+            parts=data.split(':'); oid=int(parts[1]); o=self.current(uid,oid)
+            if o['step']!=2 or (isinstance(mid,int) and o['form_msg']!=mid):
+                raise ValueError('Выбор даты уже завершён. Используйте текущий экран.')
+            if parts[0]=='manual':
+                self.s.set_order(oid,date_manual=1); await self.form(oid)
+            else:
+                try: value=datetime.strptime(parts[2],'%Y-%m-%d').strftime('%d.%m.%Y')
+                except ValueError: raise ValueError('Дата недоступна. Откройте выбор даты заново.') from None
+                await self.advance(o,value)
+        elif data.startswith(('approve:','editform:')):
+            oid=int(data.split(':')[1]); o=self.current(uid,oid)
+            if o['step']!=5 or (isinstance(mid,int) and o['form_msg']!=mid):
+                raise ValueError('Это устаревшая сводка. Используйте текущий экран.')
+            await self.consume(c,'summary')
+            await self.clear_screen(uid)
+            await self.remove(uid,o['receipt'])
+            self.s.set_order(oid,receipt=None,finish=0,step=0 if data.startswith('editform:') else 6)
+            if data.startswith('editform:'): await self.form(oid)
+            else:
+                self.s.set_order(oid,waiting=o['waiting'] or time.time(),activity=time.time())
+                self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'carddirty:{oid}','1'))
+                await self.receipt(oid)
+        elif data.startswith(('finish:','nofiles:')):
             oid=int(data.split(':')[1]); o=self.current(uid,oid)
             if o['status'] in TERMINAL: raise ValueError('Заказ уже завершён')
+            if o['step'] not in (-1,6): raise ValueError('Сначала заполните и подтвердите анкету.')
+            if isinstance(mid,int) and o['receipt'] and mid!=o['receipt']:
+                raise ValueError('Это старая кнопка. Используйте актуальное сообщение о материалах.')
             if not o['fact']:
                 self.s.set_order(oid,fact=self.s.fact(uid,FACTS))
             if not o['receipt']:
@@ -633,6 +711,29 @@ class App:
         except Exception:
             log.error('Unable to deliver admin alert')
 
+    async def delivery_issue(self,row,error):
+        o=self.s.order(row['oid'])
+        if row['direction']=='out':
+            if not row['alerted']:
+                await self.alert(f'⚠️ Ответ по {self.label(o)} пока не доставлен клиенту. Причина: {error}. Проверьте доступ и /retry.',o['id'])
+                self.s.execute('UPDATE queue SET alerted=1 WHERE id=?',(row['id'],))
+            return
+        if not o['delay_admin']:
+            try:
+                msg=await self.bot.send_message(self.owner or self.forum,
+                    f'⚠️ Не удаётся передать сообщения: {self.label(o)}. Причина: {error}. Проверьте права и /retry.',
+                    message_thread_id=o['thread'] if not self.owner else None)
+                self.s.set_order(o['id'],delay_admin=msg.message_id)
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
+                return
+        if not o['delay_msg']:
+            try:
+                msg=await self.bot.send_message(o['user_id'],
+                  'Передача сообщений временно задерживается. Они сохранены; менеджеру отправлено уведомление.',disable_notification=True)
+                self.s.set_order(o['id'],delay_msg=msg.message_id)
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
+                pass
+
     async def deliver(self,rows):
         r=rows[0]; o=self.s.order(r['oid'])
         if not o['thread']: await self.ensure_topic(o['id']); o=self.s.order(o['id'])
@@ -667,7 +768,8 @@ class App:
             # Messages received after this reply was queued still need an answer.
             later=self.s.one("SELECT MIN(created) t FROM queue WHERE oid=? AND direction='in' AND created>?",(o['id'],max(x['created'] for x in rows)))['t']
             self.s.set_order(o['id'],waiting=later,reminded=0,activity=time.time())
-        await self.card(o['id'])
+        # Card UI errors are not message delivery errors.
+        self.s.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',(f'carddirty:{o["id"]}','1'))
 
     async def tick(self):
         await self.publish_reviews()
@@ -679,6 +781,13 @@ class App:
             try: await self.ensure_topic(o['id'])
             except Exception:
                 log.exception('Topic creation delayed for order %s',o['id'])
+        for item in self.s.all("SELECT key FROM meta WHERE key LIKE 'carddirty:%' LIMIT 3"):
+            oid=int(item['key'].split(':')[1])
+            try:
+                await self.card(oid)
+                if self.s.order(oid)['thread']: self.s.execute('DELETE FROM meta WHERE key=?',(item['key'],))
+            except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter,TelegramNetworkError):
+                log.warning('Card refresh deferred for order %s',oid)
         rows=self.s.next_batch()
         if rows:
             try: await self.deliver(rows)
@@ -692,24 +801,34 @@ class App:
                     if self.s.one('SELECT state FROM queue WHERE id=?',(row['id'],))['state']=='sent': continue
                     self.s.execute('UPDATE queue SET state=?,tries=?,due=?,error=? WHERE id=?',
                         ('failed' if failed else 'pending',tries,time.time()+delay,type(e).__name__,row['id']))
-                if not rows[0]['alerted']:
-                    self.s.execute('UPDATE queue SET alerted=1 WHERE id=?',(rows[0]['id'],))
-                    await self.alert(f"⚠️ Задержка передачи по {self.label(self.s.order(rows[0]['oid']))}. Проверьте очередь командой /retry в теме. Ошибка: {type(e).__name__}",rows[0]['oid'])
-                    if rows[0]['direction']=='in':
-                        try: await self.bot.send_message(self.s.order(rows[0]['oid'])['user_id'],'Передача материалов задерживается. Они сохранены, менеджер уведомлён.',disable_notification=True)
-                        except Exception: pass
+                unsent=any(self.s.one('SELECT state FROM queue WHERE id=?',(r['id'],))['state']!='sent' for r in rows)
+                # One quick retry/rate limit is normal, not a client-facing incident.
+                if unsent and not isinstance(e,TelegramRetryAfter) and (failed or (tries>=3 and time.time()-rows[0]['created']>=30)):
+                    await self.delivery_issue(rows[0],type(e).__name__)
+        for o in self.s.all('SELECT * FROM orders WHERE delay_msg IS NOT NULL'):
+            if not self.s.pending(o['id']):
+                try:
+                    await self.remove(o['user_id'],o['delay_msg'])
+                    self.s.set_order(o['id'],delay_msg=None)
+                    if o['delay_admin']:
+                        await self.remove(self.owner or self.forum,o['delay_admin'])
+                        self.s.set_order(o['id'],delay_admin=None)
+                except (TelegramForbiddenError,TelegramNetworkError,TelegramRetryAfter):
+                    log.warning('Recovery notice update deferred')
         for o in self.s.all('SELECT * FROM orders WHERE finish=1'):
             if self.s.user(o['user_id'])['selected']!=o['id']: continue
             if self.s.pending(o['id']): continue
+            if not o['thread'] or not o['card'] or self.s.one('SELECT value FROM meta WHERE key=?',(f'carddirty:{o["id"]}',)):
+                continue
             try:
-                await self.bot.edit_message_text(f"{self.label(o)}: материалы переданы менеджеру ✅\nОтвет придёт сюда. Дополнения можно отправлять в этот чат.\n\n💡 Учебная минутка\n{escape(o['fact'] or '')}",
+                await self.bot.edit_message_text(f"✅ <b>Заявка передана менеджеру</b>\n\nОтвет придёт в этот чат. Дополнить заявку можно обычным сообщением.\n\n💡 <b>Учебная минутка</b>\n{escape(o['fact'] or '')}",
                     chat_id=o['user_id'],message_id=o['receipt'])
             except TelegramBadRequest as e:
                 if 'not modified' not in str(e):
                     await self.alert(f"Не удалось обновить подтверждение заказа {self.label(o)}",o['id'])
             except TelegramForbiddenError:
                 await self.alert(f"Клиент заказа {self.label(o)} недоступен для подтверждения.",o['id'])
-            self.s.set_order(o['id'],finish=0,batch=0)
+            self.s.set_order(o['id'],finish=0,batch=0,step=-1)
         for item in self.s.all("SELECT * FROM meta WHERE key LIKE 'close:%' LIMIT 5"):
             oid=int(item['key'].split(':')[1]); o=self.s.order(oid)
             notice=json.loads(item['value'])
@@ -746,10 +865,13 @@ class App:
                 self.s.set_order(o['id'],warned=1)
 
     async def guide(self):
-        if self.s.one("SELECT value FROM meta WHERE key='guide_v31'"): return
-        t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3.1')
+        if self.s.one("SELECT value FROM meta WHERE key='guide_v32'"): return
+        t=await self.bot.create_forum_topic(self.forum,name='📖 OneStudy · инструкция v3.2')
         msg=await self.bot.send_message(self.forum,
-          '<b>OneStudy v3.1 · менеджеру</b>\n\n'
+          '<b>OneStudy v3.2 · менеджеру</b>\n\n'
+          'Анкета: дата кнопкой или вручную → антиплагиат Да/Нет/Не знаю → '
+          'необязательный процент при Да → тема → сводка → материалы.\n'
+          'Ответы анкеты сохраняются в карточке, без отдельной пересылки каждого поля.\n\n'
           '/orders или /clients — список заказов.\n'
           '/search Анна — поиск по имени; также можно указать номер или Telegram ID.\n'
           '/done — завершение с подтверждением в теме заказа.\n'
@@ -767,7 +889,7 @@ class App:
           message_thread_id=t.message_thread_id,disable_notification=True,
           reply_markup=keyboard([[('📋 Заказы','dash:all:0')]]))
         await self.bot.pin_chat_message(self.forum,msg.message_id,disable_notification=True)
-        self.s.execute("INSERT INTO meta VALUES('guide_v31',?)",(str(t.message_thread_id),))
+        self.s.execute("INSERT INTO meta VALUES('guide_v32',?)",(str(t.message_thread_id),))
 
     async def worker(self):
         last_maintenance=0; last_backup=0
